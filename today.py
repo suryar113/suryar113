@@ -64,6 +64,7 @@ LINE_H = 20
 PAD = 15
 GAP = 30
 MIN_ART_SCALE = 0.53  # smallest art font, as a fraction of FONT_SIZE
+MAX_ART_W = 460  # widest the art may get, in px; wide art is shrunk and centred vertically
 WIDTH_CHARS = 64  # right-hand column width in characters
 
 THEMES = {
@@ -286,24 +287,45 @@ def card_lines(stats):
     return lines
 
 
-def render(art, lines, colors):
-    # The art is scaled to the card's height. The card is at least as tall as the info column,
+ART_CLASSES = {"k": "key", "v": "value", "c": "cc", "a": "addColor", "d": "delColor"}
+
+
+def art_runs(text, codes):
+    """Split a line of art into (text, css class) runs using its line in ascii_colors.txt."""
+    runs = []
+    for ch, code in zip(text, codes.ljust(len(text))):
+        cls = ART_CLASSES.get(code)
+        if runs and runs[-1][1] == cls:
+            runs[-1][0] += ch
+        else:
+            runs.append([ch, cls])
+    return runs
+
+
+def render(art, lines, colors, art_colors=None):
+    # The art is scaled to the card's height, unless that would make it wider than MAX_ART_W.
+    # The card is at least as tall as the info column,
     # and grows when the art has many rows so its characters never shrink below ~8px.
     rows = max(len(lines), round(len(art) * MIN_ART_SCALE))
     height = PAD * 2 + rows * LINE_H
-    scale = rows / max(1, len(art))
-    top = (rows - len(lines)) // 2  # centre the info column beside taller art
     art_cols = max((len(l) for l in art), default=0)
+    scale = min(rows / max(1, len(art)), MAX_ART_W / max(1, art_cols * CHAR_W))
+    top = (rows - len(lines)) // 2  # centre the info column beside taller art
+    art_top = (rows - len(art) * scale) * LINE_H / 2  # and the art beside a taller info column
     info_x = PAD + art_cols * CHAR_W * scale + GAP
     width = round(info_x + WIDTH_CHARS * CHAR_W + PAD)
     y = lambda i: PAD + LINE_H * (i + 1 + top) - 5
-    art_y = lambda i: PAD + LINE_H * scale * (i + 1) - 5 * scale
+    art_y = lambda i: PAD + art_top + LINE_H * scale * (i + 1) - 5 * scale
 
     def run(text, cls):
         text = escape(text)
         return f'<tspan class="{cls}">{text}</tspan>' if cls else text
 
-    art_svg = "\n".join(f'<tspan x="{PAD}" y="{art_y(i):.1f}">{escape(l)}</tspan>' for i, l in enumerate(art))
+    codes = art_colors or [""] * len(art)
+    art_svg = "\n".join(
+        f'<tspan x="{PAD}" y="{art_y(i):.1f}">{"".join(run(t, c) for t, c in art_runs(l, codes[i] if i < len(codes) else ""))}</tspan>'
+        for i, l in enumerate(art)
+    )
     info_svg = "\n".join(
         f'<tspan x="{info_x:.1f}" y="{y(i)}">{"".join(run(t, c) for t, c in line)}</tspan>'
         for i, line in enumerate(lines) if line
@@ -344,8 +366,10 @@ if __name__ == "__main__":
     art = {"dark_mode.svg": load("ascii.txt")}
     # Photos get a second, tone-inverted copy for the light card; a monogram reuses the dark one.
     art["light_mode.svg"] = load("ascii_light.txt") if (ROOT / "ascii_light.txt").exists() else art["dark_mode.svg"]
+    # Optional per-character colours for the art, one code per character (see ART_CLASSES).
+    art_colors = load("ascii_colors.txt") if (ROOT / "ascii_colors.txt").exists() else None
     lines = card_lines(stats)
     for name, colors in THEMES.items():
-        (ROOT / name).write_text(render(art[name], lines, colors))
+        (ROOT / name).write_text(render(art[name], lines, colors, art_colors))
     print(json.dumps({k: str(v) for k, v in stats.items()}, indent=2))
     print(f"{calls} GraphQL calls")
