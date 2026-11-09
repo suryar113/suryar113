@@ -102,7 +102,6 @@ query($login: String!) {
   user(login: $login) {
     id
     createdAt
-    followers { totalCount }
     contributed: repositories(ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]) { totalCount }
   }
 }"""
@@ -115,7 +114,6 @@ query($login: String!, $after: String, $aff: [RepositoryAffiliation]) {
       pageInfo { hasNextPage endCursor }
       nodes {
         nameWithOwner
-        stargazerCount
         refs(refPrefix: "refs/heads/", first: 100) { nodes { name target { oid } } }
       }
     }
@@ -202,15 +200,13 @@ def lines_of_code(user_id):
 
 def get_stats():
     user = gql(USER_Q, login=USER_NAME)["user"]
-    repo_count, owned = all_repos(["OWNER"])
+    repo_count, _ = all_repos(["OWNER"])
     commits, adds, dels = lines_of_code(user["id"])
     created = dt.datetime.fromisoformat(user["createdAt"].replace("Z", "+00:00")).date()
     return {
         "since": BIRTHDAY or created,
         "repos": repo_count,
         "contributed": user["contributed"]["totalCount"],
-        "stars": sum(r["stargazerCount"] for r in owned),
-        "followers": user["followers"]["totalCount"],
         "commits": commits,
         "loc_add": adds,
         "loc_del": dels,
@@ -237,13 +233,13 @@ def uptime(start, today=None):
     return f"{plural(years, 'year')}, {plural(months, 'month')}, {plural(days, 'day')}"
 
 
-def entry(key, value, width, lead=True):
+def entry(key, value, width):
     """A dotted 'key: .... value' cell padded to exactly `width` characters.
 
     `value` is a string or a list of (text, css class) runs.
     """
     runs = [(value, "value")] if isinstance(value, str) else value
-    head = ([(". ", "cc")] if lead else []) + [(key, "key"), (":", None)]
+    head = [(". ", "cc"), (key, "key"), (":", None)]
     used = sum(len(t) for t, _ in head + runs)
     gap = max(1, width - used)
     dots = " " * gap if gap < 3 else " " + "." * (gap - 2) + " "
@@ -266,17 +262,11 @@ def card_lines(stats):
             key, value = item
             lines.append(entry(key, value.format(uptime=uptime(stats["since"])), WIDTH_CHARS))
 
-    left, sep = 36, [(" | ", None)]
-    right = WIDTH_CHARS - left - 3
     lines.append(
         entry("Repos", [(n(stats["repos"]), "value"), (" {", None), ("Contributed", "key"),
-                        (": ", None), (n(stats["contributed"]), "value"), ("}", None)], left)
-        + sep + entry("Stars", n(stats["stars"]), right, lead=False)
+                        (": ", None), (n(stats["contributed"]), "value"), ("}", None)], WIDTH_CHARS)
     )
-    lines.append(
-        entry("Commits", n(stats["commits"]), left)
-        + sep + entry("Followers", n(stats["followers"]), right, lead=False)
-    )
+    lines.append(entry("Commits", n(stats["commits"]), WIDTH_CHARS))
     lines.append(
         entry("Lines of Code on GitHub",
               [(n(stats["loc_add"] - stats["loc_del"]), "value"), (" ( ", None),
