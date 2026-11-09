@@ -1,6 +1,6 @@
 """Make the ASCII art for the left side of the card.
 
-    python tools/make_ascii.py --image me.png --mask mask.png --crop 450,150,920,700
+    python tools/make_ascii.py --image me.png --mask mask.png --crop 450,150,920,700 --rotate 9.5
     python tools/make_ascii.py --text SR
 
 Writes ascii.txt (dark card: bright pixels get dense characters) and, for photos,
@@ -10,6 +10,8 @@ ascii_light.txt (light card: dark pixels get dense characters, so it isn't a neg
 keeps a busy background out of the art. On a Mac, make one with
     swift tools/mask.swift me.png mask.png
 --crop is the left,top,right,bottom box to use; it is widened to the card's art aspect.
+--rotate turns the photo counter-clockwise by that many degrees around the crop's centre,
+to straighten a tilted head (negative turns it clockwise).
 
 Needs Pillow (pip install pillow); photos also need OpenCV and NumPy (pip install opencv-python).
 Any grid size works: the card scales the art to fit, growing taller if it has many rows.
@@ -82,7 +84,7 @@ def monogram(letters, cols, rows, font_path):
     return img, img
 
 
-def portrait(path, mask_path, crop, cols, rows, detail=1.5):
+def portrait(path, mask_path, crop, cols, rows, detail=1.5, rotate=0.0):
     """A greyscale image (brighter = denser on the dark card) and a subject mask."""
     import cv2
     import numpy as np
@@ -91,6 +93,11 @@ def portrait(path, mask_path, crop, cols, rows, detail=1.5):
     mask = cv2.imread(mask_path, 0) if mask_path else np.full(img.shape[:2], 255, np.uint8)
     mask = cv2.resize(mask, (img.shape[1], img.shape[0]))
     left, top, right, bottom = crop or (0, 0, img.shape[1], img.shape[0])
+    if rotate:
+        turn = cv2.getRotationMatrix2D(((left + right) / 2, (top + bottom) / 2), rotate, 1.0)
+        size = (img.shape[1], img.shape[0])
+        img = cv2.warpAffine(img, turn, size, flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        mask = cv2.warpAffine(mask, turn, size, flags=cv2.INTER_LINEAR, borderValue=0)
     # Widen (or heighten) the box around its centre to match the art's aspect ratio.
     aspect = cols * CELL_W / (rows * CELL_H)
     h = bottom - top
@@ -151,6 +158,7 @@ if __name__ == "__main__":
     ap.add_argument("--cols", type=int, default=100)
     ap.add_argument("--rows", type=int, default=56)
     ap.add_argument("--detail", type=float, default=1.5, help="how strongly to sharpen features")
+    ap.add_argument("--rotate", type=float, default=0.0, help="degrees counter-clockwise, to level the head")
     ap.add_argument("--font", help="a bold font (--text) or a monospace font (--image)")
     args = ap.parse_args()
 
@@ -161,7 +169,7 @@ if __name__ == "__main__":
         (ROOT / "ascii_light.txt").unlink(missing_ok=True)  # a monogram reads the same on both
     else:
         crop = tuple(int(v) for v in args.crop.split(",")) if args.crop else None
-        img, mask = portrait(args.image, args.mask, crop, args.cols, args.rows, args.detail)
+        img, mask = portrait(args.image, args.mask, crop, args.cols, args.rows, args.detail, args.rotate)
         chars, levels = measured_ramp(args.font or find_font(MONO_FONTS))
         for name, invert in (("ascii.txt", False), ("ascii_light.txt", True)):
             art = to_ascii(img, mask, args.cols, args.rows, chars, levels, invert, dither=0.8)
