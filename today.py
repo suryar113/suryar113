@@ -9,6 +9,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -359,7 +360,14 @@ if __name__ == "__main__":
     # Optional per-character colours for the art, one code per character (see ART_CLASSES).
     art_colors = load("ascii_colors.txt") if (ROOT / "ascii_colors.txt").exists() else None
     lines = card_lines(stats)
+    readme = (ROOT / "README.md").read_text()
     for name, colors in THEMES.items():
-        (ROOT / name).write_text(render(art[name], lines, colors, art_colors))
+        svg = render(art[name], lines, colors, art_colors)
+        (ROOT / name).write_text(svg)
+        # Browsers cache the card for a few minutes. Tagging its URL with a hash of its content
+        # makes every changed card a new URL, so the profile shows it straight away.
+        version = hashlib.sha256(svg.encode()).hexdigest()[:10]
+        readme = re.sub(re.escape(name) + r"(\?v=[0-9a-f]+)?", f"{name}?v={version}", readme)
+    (ROOT / "README.md").write_text(readme)
     print(json.dumps({k: str(v) for k, v in stats.items()}, indent=2))
     print(f"{calls} GraphQL calls")
