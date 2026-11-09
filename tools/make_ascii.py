@@ -12,6 +12,11 @@ keeps a busy background out of the art. On a Mac, make one with
 --crop is the left,top,right,bottom box to use; it is widened to the card's art aspect.
 --rotate turns the photo counter-clockwise by that many degrees around the crop's centre,
 to straighten a tilted head (negative turns it clockwise).
+--crisp is a left,top,right,bottom box (in the original photo) holding printed lettering, such
+as a logo on a cap. Inside it the photo is split into ink and background, and characters are
+picked by shape instead of shading, so the letters stay sharp.
+--label "TEXT@x,y" writes TEXT into the art, centred on that point of the original photo, for
+lettering too small to survive as shapes (repeatable).
 
 Needs Pillow (pip install pillow); photos also need OpenCV and NumPy (pip install opencv-python).
 Any grid size works: the card scales the art to fit, growing taller if it has many rows.
@@ -84,20 +89,26 @@ def monogram(letters, cols, rows, font_path):
     return img, img
 
 
-def portrait(path, mask_path, crop, cols, rows, detail=1.5, rotate=0.0):
-    """A greyscale image (brighter = denser on the dark card) and a subject mask."""
+def portrait(path, mask_path, crop, cols, rows, detail=1.5, rotate=0.0, crisp=None):
+    """A greyscale image (brighter = denser on the dark card), a subject mask, a mask of the
+    --crisp box, and a function mapping a point of the original photo to (column, row)."""
     import cv2
     import numpy as np
 
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     mask = cv2.imread(mask_path, 0) if mask_path else np.full(img.shape[:2], 255, np.uint8)
     mask = cv2.resize(mask, (img.shape[1], img.shape[0]))
+    region = np.zeros(img.shape[:2], np.uint8)
+    if crisp:
+        region[crisp[1]:crisp[3], crisp[0]:crisp[2]] = 255
     left, top, right, bottom = crop or (0, 0, img.shape[1], img.shape[0])
+    turn = np.float32([[1, 0, 0], [0, 1, 0]])
     if rotate:
         turn = cv2.getRotationMatrix2D(((left + right) / 2, (top + bottom) / 2), rotate, 1.0)
         size = (img.shape[1], img.shape[0])
         img = cv2.warpAffine(img, turn, size, flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
         mask = cv2.warpAffine(mask, turn, size, flags=cv2.INTER_LINEAR, borderValue=0)
+        region = cv2.warpAffine(region, turn, size, flags=cv2.INTER_NEAREST, borderValue=0)
     # Widen (or heighten) the box around its centre to match the art's aspect ratio.
     aspect = cols * CELL_W / (rows * CELL_H)
     h = bottom - top
@@ -107,7 +118,7 @@ def portrait(path, mask_path, crop, cols, rows, detail=1.5, rotate=0.0):
         h = w / aspect
     cx, cy = (left + right) / 2, (top + bottom) / 2
     x0, y0, x1, y1 = (round(v) for v in (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2))
-    img, mask = img[y0:y1, x0:x1], mask[y0:y1, x0:x1]
+    img, mask, region = img[y0:y1, x0:x1], mask[y0:y1, x0:x1], region[y0:y1, x0:x1]
 
     lum = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32) / 255
     subject = mask > 128
@@ -122,12 +133,58 @@ def portrait(path, mask_path, crop, cols, rows, detail=1.5, rotate=0.0):
     ranked = np.sort(base[subject])
     tone = np.searchsorted(ranked, base).astype(np.float32) / len(ranked) + detail * fine
     tone = np.clip(tone, 0, 1)
-    return Image.fromarray((tone * 255).astype("uint8")), Image.fromarray(mask)
+    inside = region > 0
+    if inside.any():
+        # Lettering: a clean two-level split (Otsu's threshold) of the original brightness.
+        raw = (lum * 255).astype(np.uint8)
+        cut, _ = cv2.threshold(raw[inside], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        ink = cv2.GaussianBlur((raw > cut).astype(np.float32), (0, 0), 0.7)
+        tone[inside] = ink[inside]
+    as_image = lambda a: Image.fromarray(a.astype("uint8"))
+
+    def to_cell(px, py):
+        px, py = turn @ np.float32([px, py, 1])
+        return (px - x0) / (x1 - x0) * cols, (py - y0) / (y1 - y0) * rows
+
+    return as_image(tone * 255), as_image(mask), as_image(region), to_cell
 
 
-def to_ascii(img, mask, cols, rows, chars, levels, invert=False, dither=0.0):
+def shape_match(img, region, cols, rows, font_path, invert=False):
+    """{(x, y): char} for the cells inside `region`, each picked by comparing a 3x5 grid of the
+    cell with the same grid of every glyph, so strokes land where the ink is (_ low, - middle,
+    / and \\ on diagonals) and not just at the right density."""
+    import numpy as np
+
+    sx, sy, cw, ch = 3, 5, 12, 25
+    font = ImageFont.truetype(font_path, 20)
+    # Punctuation only: letters and digits here would read as stray words on the logo.
+    chars = list(" _-=^~`'\".,:;!|/\\()[]{}<>@#%*+")
+    glyphs = []
+    for c in chars:
+        im = Image.new("L", (cw, ch), 0)
+        ImageDraw.Draw(im).text((0, 19), c, fill=255, font=font, anchor="ls")
+        glyphs.append(np.asarray(im.resize((sx, sy), Image.BOX), np.float32).ravel() / 255)
+    glyphs = np.stack(glyphs)
+    gmean = glyphs.mean(1)
+    target = np.asarray(img.resize((cols * sx, rows * sy), Image.BOX), np.float32) / 255
+    if invert:
+        target = 1 - target
+    cells = target.reshape(rows, sy, cols, sx).transpose(0, 2, 1, 3).reshape(rows, cols, sx * sy)
+    cells = cells * gmean.max()  # full brightness = the densest glyph
+    inside = np.asarray(region.resize((cols, rows), Image.BOX)) > 127
+    picked = {}
+    for y, x in zip(*np.nonzero(inside)):
+        p = cells[y, x]
+        shape = (((p - p.mean()) - (glyphs - gmean[:, None])) ** 2).sum(1)
+        tone = (p.mean() - gmean) ** 2 * sx * sy
+        picked[(x, y)] = chars[int((shape + 4 * tone).argmin())]
+    return picked
+
+
+def to_ascii(img, mask, cols, rows, chars, levels, invert=False, dither=0.0, fixed=None):
     """One character per cell, picked by tone. With dither > 0, each cell's rounding error is
-    passed on to its neighbours (Floyd-Steinberg), which keeps soft gradients like skin."""
+    passed on to its neighbours (Floyd-Steinberg), which keeps soft gradients like skin.
+    Cells in `fixed` ({(x, y): char}, from shape_match) are used as given."""
     px = img.resize((cols, rows), Image.BOX).load()
     mk = mask.resize((cols, rows), Image.BOX).load()
     v = [[(1 - px[x, y] / 255) if invert else px[x, y] / 255 for x in range(cols)] for y in range(rows)]
@@ -137,6 +194,9 @@ def to_ascii(img, mask, cols, rows, chars, levels, invert=False, dither=0.0):
         for x in range(cols):
             if mk[x, y] < 110:
                 line += " "
+                continue
+            if fixed and (x, y) in fixed:
+                line += fixed[(x, y)]
                 continue
             i = min(range(len(levels)), key=lambda k: abs(levels[k] - v[y][x]))
             line += chars[i]
@@ -159,6 +219,8 @@ if __name__ == "__main__":
     ap.add_argument("--rows", type=int, default=56)
     ap.add_argument("--detail", type=float, default=1.5, help="how strongly to sharpen features")
     ap.add_argument("--rotate", type=float, default=0.0, help="degrees counter-clockwise, to level the head")
+    ap.add_argument("--crisp", help="left,top,right,bottom box of printed lettering, e.g. a cap logo")
+    ap.add_argument("--label", action="append", default=[], help='"TEXT@x,y" written into the art')
     ap.add_argument("--font", help="a bold font (--text) or a monospace font (--image)")
     args = ap.parse_args()
 
@@ -168,10 +230,19 @@ if __name__ == "__main__":
         (ROOT / "ascii.txt").write_text(to_ascii(img, mask, args.cols, args.rows, RAMP, levels))
         (ROOT / "ascii_light.txt").unlink(missing_ok=True)  # a monogram reads the same on both
     else:
-        crop = tuple(int(v) for v in args.crop.split(",")) if args.crop else None
-        img, mask = portrait(args.image, args.mask, crop, args.cols, args.rows, args.detail, args.rotate)
-        chars, levels = measured_ramp(args.font or find_font(MONO_FONTS))
+        box = lambda v: tuple(int(n) for n in v.split(",")) if v else None
+        img, mask, region, to_cell = portrait(args.image, args.mask, box(args.crop), args.cols, args.rows,
+                                     args.detail, args.rotate, box(args.crisp))
+        font = args.font or find_font(MONO_FONTS)
+        chars, levels = measured_ramp(font)
         for name, invert in (("ascii.txt", False), ("ascii_light.txt", True)):
-            art = to_ascii(img, mask, args.cols, args.rows, chars, levels, invert, dither=0.8)
+            fixed = shape_match(img, region, args.cols, args.rows, font, invert)
+            for label in args.label:
+                text, at = label.rsplit("@", 1)
+                cx, cy = to_cell(*box(at))
+                start = round(cx - len(text) / 2)
+                for i, c in enumerate(f" {text} "):  # a blank on each side sets the word apart
+                    fixed[(start - 1 + i, int(cy))] = c
+            art = to_ascii(img, mask, args.cols, args.rows, chars, levels, invert, dither=0.8, fixed=fixed)
             (ROOT / name).write_text(art)
     print((ROOT / "ascii.txt").read_text())
