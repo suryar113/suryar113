@@ -1,6 +1,6 @@
 """Make the ASCII art for the left side of the card.
 
-    python tools/make_ascii.py --image me.png --mask mask.png --crop 300,70,1060,830
+    python tools/make_ascii.py --image me.png --mask mask.png --crop 450,150,920,700
     python tools/make_ascii.py --text SR
 
 Writes ascii.txt (dark card: bright pixels get dense characters) and, for photos,
@@ -11,30 +11,53 @@ keeps a busy background out of the art. On a Mac, make one with
     swift tools/mask.swift me.png mask.png
 --crop is the left,top,right,bottom box to use; it is widened to the card's art aspect.
 
-Needs Pillow (pip install pillow); photos also need OpenCV (pip install opencv-python).
+Needs Pillow (pip install pillow); photos also need OpenCV and NumPy (pip install opencv-python).
 Any grid size works: the card scales the art to fit, growing taller if it has many rows.
 """
 import argparse
 import glob
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageStat
 
 ROOT = Path(__file__).resolve().parent.parent
 RAMP = " .:-=+*#%@"
 CELL_W, CELL_H = 9.64, 20  # one character cell on the card, in px
 
 
-def find_font():
-    for pattern in (
-        "/System/Library/Fonts/Supplemental/Arial Black.ttf",
-        "/usr/share/fonts/**/DejaVuSans-Bold.ttf",
-        "C:/Windows/Fonts/ariblk.ttf",
-    ):
+def find_font(patterns):
+    for pattern in patterns:
         hits = glob.glob(pattern, recursive=True)
         if hits:
             return hits[0]
-    raise SystemExit("No bold font found; pass --font /path/to/font.ttf")
+    raise SystemExit("No suitable font found; pass --font /path/to/font.ttf")
+
+
+BOLD_FONTS = ("/System/Library/Fonts/Supplemental/Arial Black.ttf",
+              "/usr/share/fonts/**/DejaVuSans-Bold.ttf", "C:/Windows/Fonts/ariblk.ttf")
+MONO_FONTS = ("/System/Library/Fonts/Menlo.ttc", "/usr/share/fonts/**/DejaVuSansMono.ttf",
+              "C:/Windows/Fonts/consola.ttf")
+
+
+def measured_ramp(font_path, steps=24):
+    """Characters whose ink coverage, measured in the card's monospace font, is evenly spaced
+    from blank to densest. A long, even ramp keeps skin tones from collapsing into one symbol.
+    Returns (chars, coverage in 0..1)."""
+    font = ImageFont.truetype(font_path, 20)
+    cov = {}
+    for code in range(32, 127):
+        im = Image.new("L", (12, 25), 0)
+        ImageDraw.Draw(im).text((0, 19), chr(code), fill=255, font=font, anchor="ls")
+        cov[chr(code)] = ImageStat.Stat(im).mean[0] / 255
+    top = max(cov.values())
+    chars, levels = [], []
+    for i in range(steps):
+        target = i / (steps - 1)
+        ch = min(cov, key=lambda c: abs(cov[c] / top - target))
+        if ch not in chars:
+            chars.append(ch)
+            levels.append(cov[ch] / top)
+    return chars, levels
 
 
 def monogram(letters, cols, rows, font_path):
@@ -59,8 +82,8 @@ def monogram(letters, cols, rows, font_path):
     return img, img
 
 
-def portrait(path, mask_path, crop, cols, rows, gamma=0.85, clip=3.0, edge=1.0):
-    """A float image in 0..1 (brighter = denser on the dark card) and a subject mask."""
+def portrait(path, mask_path, crop, cols, rows, detail=1.5):
+    """A greyscale image (brighter = denser on the dark card) and a subject mask."""
     import cv2
     import numpy as np
 
@@ -79,24 +102,28 @@ def portrait(path, mask_path, crop, cols, rows, gamma=0.85, clip=3.0, edge=1.0):
     x0, y0, x1, y1 = (round(v) for v in (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2))
     img, mask = img[y0:y1, x0:x1], mask[y0:y1, x0:x1]
 
-    lum = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[:, :, 0]
+    lum = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32) / 255
     subject = mask > 128
-    # Local contrast (CLAHE) pulls detail out of dark skin and under a cap brim. The background
-    # is flattened first so the cutout's edge isn't mistaken for contrast.
-    flat = lum.copy()
-    flat[~subject] = int(np.median(lum[subject]))
-    tone = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(flat).astype(np.float32) / 255
-    tone = tone ** gamma
-    # A difference of Gaussians darkens fine outlines (eyes, nostrils, lips) and lightens flats.
-    g = lum.astype(np.float32) / 255
-    dog = cv2.GaussianBlur(g, (0, 0), 3) - cv2.GaussianBlur(g, (0, 0), 9)
-    tone = np.clip(tone - edge * 6 * dog, 0, 1)
+    lum[~subject] = np.median(lum[subject])  # so the cutout's edge isn't mistaken for detail
+    # Split the photo into broad shading and fine detail. The broad shading is replaced by
+    # its rank within the subject (histogram equalisation), so a bright cap can't use up the
+    # whole range and leave the face in a narrow band. The fine detail (nose, lips, jaw,
+    # the sunglasses' frame) is then added back on top, amplified.
+    s = 0.012 * img.shape[1]
+    base = cv2.GaussianBlur(lum, (0, 0), s)
+    fine = lum - cv2.GaussianBlur(lum, (0, 0), 4 * s)
+    ranked = np.sort(base[subject])
+    tone = np.searchsorted(ranked, base).astype(np.float32) / len(ranked) + detail * fine
+    tone = np.clip(tone, 0, 1)
     return Image.fromarray((tone * 255).astype("uint8")), Image.fromarray(mask)
 
 
-def to_ascii(img, mask, cols, rows, invert=False):
+def to_ascii(img, mask, cols, rows, chars, levels, invert=False, dither=0.0):
+    """One character per cell, picked by tone. With dither > 0, each cell's rounding error is
+    passed on to its neighbours (Floyd-Steinberg), which keeps soft gradients like skin."""
     px = img.resize((cols, rows), Image.BOX).load()
     mk = mask.resize((cols, rows), Image.BOX).load()
+    v = [[(1 - px[x, y] / 255) if invert else px[x, y] / 255 for x in range(cols)] for y in range(rows)]
     lines = []
     for y in range(rows):
         line = ""
@@ -104,10 +131,12 @@ def to_ascii(img, mask, cols, rows, invert=False):
             if mk[x, y] < 110:
                 line += " "
                 continue
-            v = px[x, y] / 255
-            if invert:
-                v = 1 - v
-            line += RAMP[min(len(RAMP) - 1, 1 + int(v * (len(RAMP) - 1)))]
+            i = min(range(len(levels)), key=lambda k: abs(levels[k] - v[y][x]))
+            line += chars[i]
+            err = (v[y][x] - levels[i]) * dither
+            for dx, dy, wt in ((1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1)):
+                if 0 <= x + dx < cols and y + dy < rows:
+                    v[y + dy][x + dx] += err * wt / 16
         lines.append(line.rstrip())
     return "\n".join(lines) + "\n"
 
@@ -121,16 +150,20 @@ if __name__ == "__main__":
     ap.add_argument("--crop", help="left,top,right,bottom box in photo pixels")
     ap.add_argument("--cols", type=int, default=100)
     ap.add_argument("--rows", type=int, default=56)
-    ap.add_argument("--font")
+    ap.add_argument("--detail", type=float, default=1.5, help="how strongly to sharpen features")
+    ap.add_argument("--font", help="a bold font (--text) or a monospace font (--image)")
     args = ap.parse_args()
 
     if args.text:
-        img, mask = monogram(args.text, args.cols, args.rows, args.font or find_font())
-        (ROOT / "ascii.txt").write_text(to_ascii(img, mask, args.cols, args.rows))
+        img, mask = monogram(args.text, args.cols, args.rows, args.font or find_font(BOLD_FONTS))
+        levels = [i / (len(RAMP) - 1) for i in range(len(RAMP))]
+        (ROOT / "ascii.txt").write_text(to_ascii(img, mask, args.cols, args.rows, RAMP, levels))
         (ROOT / "ascii_light.txt").unlink(missing_ok=True)  # a monogram reads the same on both
     else:
         crop = tuple(int(v) for v in args.crop.split(",")) if args.crop else None
-        img, mask = portrait(args.image, args.mask, crop, args.cols, args.rows)
-        (ROOT / "ascii.txt").write_text(to_ascii(img, mask, args.cols, args.rows))
-        (ROOT / "ascii_light.txt").write_text(to_ascii(img, mask, args.cols, args.rows, invert=True))
+        img, mask = portrait(args.image, args.mask, crop, args.cols, args.rows, args.detail)
+        chars, levels = measured_ramp(args.font or find_font(MONO_FONTS))
+        for name, invert in (("ascii.txt", False), ("ascii_light.txt", True)):
+            art = to_ascii(img, mask, args.cols, args.rows, chars, levels, invert, dither=0.8)
+            (ROOT / name).write_text(art)
     print((ROOT / "ascii.txt").read_text())
