@@ -1,7 +1,7 @@
 <a href="https://github.com/suryar113/suryar113">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/suryar113/suryar113/main/dark_mode.svg?v=444034ab1d">
-    <img alt="Surya Raghavan's GitHub profile README" src="https://raw.githubusercontent.com/suryar113/suryar113/main/light_mode.svg?v=fc3ea22781">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/suryar113/suryar113/main/dark_mode.svg?v=7f03c30ffc">
+    <img alt="Surya Raghavan's GitHub profile README" src="https://raw.githubusercontent.com/suryar113/suryar113/main/light_mode.svg?v=7e2a73712c">
   </picture>
 </a>
 
